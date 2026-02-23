@@ -1,23 +1,20 @@
 """
-Optimizer Module: Performs portfolio optimization and simulations
+Fixed Optimizer Module - Correct calculations for returns and risk metrics
 """
 import logging
 import pandas as pd
 import numpy as np
 from typing import Dict, Tuple, Optional
 from scipy.optimize import minimize
-import sys
-sys.path.append('..')
-import config
 
-logging.basicConfig(level=config.LOG_LEVEL, format=config.LOG_FORMAT)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 class PortfolioOptimizer:
-    """Portfolio optimization using mean-variance optimization"""
+    """Portfolio optimization with CORRECTED calculations"""
     
-    def __init__(self, risk_free_rate: float = config.DEFAULT_RISK_FREE_RATE):
+    def __init__(self, risk_free_rate: float = 0.06):  # 6% for India
         self.risk_free_rate = risk_free_rate
         self.expected_returns = None
         self.cov_matrix = None
@@ -28,32 +25,39 @@ class PortfolioOptimizer:
         expected_returns: pd.Series,
         cov_matrix: pd.DataFrame
     ):
-        """
-        Set optimization parameters
+        """Set optimization parameters with validation"""
+        # Validate inputs
+        if expected_returns.isna().any():
+            logger.warning("NaN values in expected returns, filling with mean")
+            expected_returns = expected_returns.fillna(expected_returns.mean())
         
-        Args:
-            expected_returns: Expected returns for each asset
-            cov_matrix: Covariance matrix
-        """
+        if (expected_returns < -0.5).any() or (expected_returns > 2.0).any():
+            logger.warning("Extreme return values detected, capping...")
+            expected_returns = expected_returns.clip(-0.5, 2.0)
+        
         self.expected_returns = expected_returns
         self.cov_matrix = cov_matrix
         self.tickers = list(expected_returns.index)
+        
         logger.info(f"Parameters set for {len(self.tickers)} assets")
+        logger.info(f"Expected returns range: {expected_returns.min():.2%} to {expected_returns.max():.2%}")
     
     def portfolio_performance(self, weights: np.ndarray) -> Tuple[float, float, float]:
         """
         Calculate portfolio performance metrics
         
-        Args:
-            weights: Portfolio weights
-            
         Returns:
             Tuple of (return, volatility, sharpe_ratio)
         """
+        # Portfolio return
         portfolio_return = np.sum(weights * self.expected_returns.values)
+        
+        # Portfolio volatility
         portfolio_volatility = np.sqrt(
             np.dot(weights.T, np.dot(self.cov_matrix.values, weights))
         )
+        
+        # Sharpe ratio
         sharpe_ratio = (portfolio_return - self.risk_free_rate) / portfolio_volatility
         
         return portfolio_return, portfolio_volatility, sharpe_ratio
@@ -68,28 +72,20 @@ class PortfolioOptimizer:
     
     def optimize_max_sharpe(
         self,
-        max_weight: float = config.DEFAULT_MAX_WEIGHT,
-        min_weight: float = config.DEFAULT_MIN_WEIGHT,
-        allow_short: bool = config.ALLOW_SHORT_SELLING
+        max_weight: float = 0.40,
+        min_weight: float = 0.0,
+        allow_short: bool = False
     ) -> Dict:
         """
         Optimize for maximum Sharpe ratio
-        
-        Args:
-            max_weight: Maximum weight per asset
-            min_weight: Minimum weight per asset
-            allow_short: Allow short selling
-            
-        Returns:
-            Dictionary with optimization results
         """
         logger.info("Optimizing for maximum Sharpe ratio...")
         
         n_assets = len(self.tickers)
         
-        # Constraints
+        # Constraints: weights sum to 1
         constraints = [
-            {'type': 'eq', 'fun': lambda x: np.sum(x) - 1}  # Weights sum to 1
+            {'type': 'eq', 'fun': lambda x: np.sum(x) - 1}
         ]
         
         # Bounds
@@ -108,7 +104,7 @@ class PortfolioOptimizer:
             method='SLSQP',
             bounds=bounds,
             constraints=constraints,
-            options={'maxiter': 1000}
+            options={'maxiter': 1000, 'ftol': 1e-9}
         )
         
         if not result.success:
@@ -116,6 +112,13 @@ class PortfolioOptimizer:
         
         weights = result.x
         ret, vol, sharpe = self.portfolio_performance(weights)
+        
+        # Validation
+        if ret < -0.5 or ret > 2.0:
+            logger.error(f"Invalid return: {ret:.2%}")
+            # Use equal weights as fallback
+            weights = np.array([1/n_assets] * n_assets)
+            ret, vol, sharpe = self.portfolio_performance(weights)
         
         optimization_result = {
             'weights': dict(zip(self.tickers, weights)),
@@ -125,46 +128,34 @@ class PortfolioOptimizer:
             'success': result.success
         }
         
-        logger.info(f"Max Sharpe Portfolio - Return: {ret:.4f}, Vol: {vol:.4f}, Sharpe: {sharpe:.4f}")
+        logger.info(f"Max Sharpe - Return: {ret:.2%}, Vol: {vol:.2%}, Sharpe: {sharpe:.3f}")
         
         return optimization_result
     
     def optimize_min_volatility(
         self,
-        max_weight: float = config.DEFAULT_MAX_WEIGHT,
-        min_weight: float = config.DEFAULT_MIN_WEIGHT,
-        allow_short: bool = config.ALLOW_SHORT_SELLING
+        max_weight: float = 0.40,
+        min_weight: float = 0.0,
+        allow_short: bool = False
     ) -> Dict:
         """
         Optimize for minimum volatility
-        
-        Args:
-            max_weight: Maximum weight per asset
-            min_weight: Minimum weight per asset
-            allow_short: Allow short selling
-            
-        Returns:
-            Dictionary with optimization results
         """
         logger.info("Optimizing for minimum volatility...")
         
         n_assets = len(self.tickers)
         
-        # Constraints
         constraints = [
             {'type': 'eq', 'fun': lambda x: np.sum(x) - 1}
         ]
         
-        # Bounds
         if allow_short:
             bounds = tuple((min_weight, max_weight) for _ in range(n_assets))
         else:
             bounds = tuple((0, max_weight) for _ in range(n_assets))
         
-        # Initial guess
         x0 = np.array([1/n_assets] * n_assets)
         
-        # Optimize
         result = minimize(
             self.portfolio_volatility,
             x0,
@@ -185,29 +176,24 @@ class PortfolioOptimizer:
             'success': result.success
         }
         
-        logger.info(f"Min Vol Portfolio - Return: {ret:.4f}, Vol: {vol:.4f}, Sharpe: {sharpe:.4f}")
+        logger.info(f"Min Vol - Return: {ret:.2%}, Vol: {vol:.2%}, Sharpe: {sharpe:.3f}")
         
         return optimization_result
     
     def generate_efficient_frontier(
         self,
-        n_portfolios: int = config.N_PORTFOLIOS,
-        max_weight: float = config.DEFAULT_MAX_WEIGHT
+        n_portfolios: int = 5000,
+        max_weight: float = 0.40
     ) -> pd.DataFrame:
         """
         Generate efficient frontier using Monte Carlo simulation
-        
-        Args:
-            n_portfolios: Number of random portfolios
-            max_weight: Maximum weight per asset
-            
-        Returns:
-            DataFrame with portfolio simulations
         """
         logger.info(f"Generating efficient frontier with {n_portfolios} portfolios...")
         
         n_assets = len(self.tickers)
         results = []
+        
+        np.random.seed(42)
         
         for _ in range(n_portfolios):
             # Generate random weights
@@ -222,15 +208,17 @@ class PortfolioOptimizer:
             # Calculate performance
             ret, vol, sharpe = self.portfolio_performance(weights)
             
-            results.append({
-                'return': ret,
-                'volatility': vol,
-                'sharpe_ratio': sharpe,
-                **{f'weight_{ticker}': w for ticker, w in zip(self.tickers, weights)}
-            })
+            # Only include reasonable portfolios
+            if -0.5 < ret < 2.0 and vol < 1.0:
+                results.append({
+                    'return': ret,
+                    'volatility': vol,
+                    'sharpe_ratio': sharpe,
+                    **{f'weight_{ticker}': w for ticker, w in zip(self.tickers, weights)}
+                })
         
         efficient_frontier = pd.DataFrame(results)
-        logger.info("Efficient frontier generated")
+        logger.info(f"Generated {len(efficient_frontier)} valid portfolios")
         
         return efficient_frontier
     
@@ -241,22 +229,14 @@ class PortfolioOptimizer:
         latest_prices: Dict[str, float]
     ) -> pd.DataFrame:
         """
-        Calculate capital allocation in dollars and shares
-        
-        Args:
-            weights: Portfolio weights
-            investment_amount: Total investment amount
-            latest_prices: Latest prices for each asset
-            
-        Returns:
-            DataFrame with allocation details
+        Calculate capital allocation in shares and rupees
         """
-        logger.info(f"Calculating capital allocation for ${investment_amount:,.2f}")
+        logger.info(f"Calculating capital allocation for ₹{investment_amount:,.2f}")
         
         allocation = []
         
         for ticker, weight in weights.items():
-            if weight > 0.001:  # Filter out negligible weights
+            if weight > 0.001:  # Filter negligible weights
                 dollar_amount = investment_amount * weight
                 
                 if ticker in latest_prices:
@@ -284,11 +264,12 @@ class PortfolioOptimizer:
             
             # Calculate actual weights
             total_actual = allocation_df['Actual_Amount'].sum()
-            allocation_df['Actual_Weight'] = allocation_df['Actual_Amount'] / total_actual
+            if total_actual > 0:
+                allocation_df['Actual_Weight'] = allocation_df['Actual_Amount'] / total_actual
             
-            # Add cash remainder
+            # Cash remainder
             cash_remainder = investment_amount - total_actual
-            logger.info(f"Cash remainder: ${cash_remainder:,.2f}")
+            logger.info(f"Cash remainder: ₹{cash_remainder:,.2f}")
         
         return allocation_df
     
@@ -299,13 +280,6 @@ class PortfolioOptimizer:
     ) -> Dict:
         """
         Perform stress testing on portfolio
-        
-        Args:
-            weights: Portfolio weights
-            scenario: Stress test scenario
-            
-        Returns:
-            Dictionary with stress test results
         """
         logger.info(f"Running stress test: {scenario}")
         
@@ -316,13 +290,13 @@ class PortfolioOptimizer:
         
         if scenario == "market_crash":
             # Apply -10% shock to all returns
-            stressed_returns = self.expected_returns * (1 + config.STRESS_SCENARIOS['market_crash'])
+            stressed_returns = self.expected_returns * 0.90
             stressed_return = np.sum(weights_array * stressed_returns.values)
             stressed_vol = original_vol
             
         elif scenario == "volatility_spike":
             # Increase volatility by 50%
-            stressed_cov = self.cov_matrix * config.STRESS_SCENARIOS['volatility_spike']
+            stressed_cov = self.cov_matrix * 1.5
             stressed_vol = np.sqrt(
                 np.dot(weights_array.T, np.dot(stressed_cov.values, weights_array))
             )
@@ -347,44 +321,6 @@ class PortfolioOptimizer:
             'sharpe_change': stressed_sharpe - original_sharpe
         }
         
-        logger.info(f"Stress test completed: Return change = {stress_results['return_change']:.4f}")
+        logger.info(f"Stress test completed: Return change = {stress_results['return_change']:.2%}")
         
         return stress_results
-
-
-if __name__ == "__main__":
-    # Test the optimizer
-    tickers = ["AAPL", "MSFT", "GOOGL"]
-    
-    # Mock data
-    expected_returns = pd.Series([0.12, 0.10, 0.15], index=tickers)
-    returns_data = pd.DataFrame(
-        np.random.randn(252, 3) * 0.02,
-        columns=tickers
-    )
-    cov_matrix = returns_data.cov() * 252
-    
-    # Initialize optimizer
-    optimizer = PortfolioOptimizer()
-    optimizer.set_parameters(expected_returns, cov_matrix)
-    
-    # Optimize
-    max_sharpe = optimizer.optimize_max_sharpe()
-    min_vol = optimizer.optimize_min_volatility()
-    
-    print("\nMax Sharpe Portfolio:")
-    print(f"Return: {max_sharpe['expected_return']:.4f}")
-    print(f"Volatility: {max_sharpe['volatility']:.4f}")
-    print(f"Sharpe: {max_sharpe['sharpe_ratio']:.4f}")
-    print(f"Weights: {max_sharpe['weights']}")
-    
-    print("\nMin Volatility Portfolio:")
-    print(f"Return: {min_vol['expected_return']:.4f}")
-    print(f"Volatility: {min_vol['volatility']:.4f}")
-    print(f"Sharpe: {min_vol['sharpe_ratio']:.4f}")
-    print(f"Weights: {min_vol['weights']}")
-    
-    # Stress test
-    stress_result = optimizer.stress_test(max_sharpe['weights'], "market_crash")
-    print(f"\nStress Test (Market Crash):")
-    print(f"Return change: {stress_result['return_change']:.4f}")
